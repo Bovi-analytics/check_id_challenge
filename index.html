@@ -68,15 +68,42 @@
 // ---------- helpers ----------
 const $ = id => document.getElementById(id);
 
-// Normalise an ID so different spellings of the same number compare equal:
-// "12", "12.0", " 12 " and, for big IDs, "-1452859018307650000",
-// "-1452859018307650000.0" and "-1.45285901830765e+18".
-// IDs that are not plain numbers (e.g. hex strings) are only trimmed.
-// The key is normalised with this same function when the page loads.
+// Normalize integer IDs without using Number().
+//
+// Number() loses precision for large integers (> 2^53-1), which can make
+// different large AnimalIds compare equal. This parser keeps everything in
+// string form and only normalizes values that are mathematically integers.
 function normalize(v) {
   v = String(v ?? '').trim();
-  if (/^[-+]?\d+(\.\d+)?([eE][-+]?\d+)?$/.test(v)) return String(Number(v));
-  return v;
+  const m = v.match(/^([+-]?)(\d+)(?:\.(\d+))?(?:[eE]([+-]?\d+))?$/);
+  if (!m) return v; // non-numeric IDs are compared as trimmed strings
+
+  const sign = m[1] === '-' ? '-' : '';
+  const intPart = m[2];
+  const fracPart = m[3] || '';
+  const exp = BigInt(m[4] || '0');
+
+  let digits = intPart + fracPart;
+  const decimalPos = BigInt(intPart.length) + exp;
+  const digitsLen = BigInt(digits.length);
+
+  if (decimalPos <= 0n) {
+    if (/[1-9]/.test(digits)) return v; // non-integer (e.g. 1e-1)
+    digits = '0';
+  } else if (decimalPos < digitsLen) {
+    const cut = Number(decimalPos);
+    const remainder = digits.slice(cut);
+    if (/[1-9]/.test(remainder)) return v; // non-integer fractional remainder
+    digits = digits.slice(0, cut);
+  } else if (decimalPos > digitsLen) {
+    const zerosToAdd = decimalPos - digitsLen;
+    if (zerosToAdd > 10000n) return v; // avoid huge allocations on pathological input
+    digits += '0'.repeat(Number(zerosToAdd));
+  }
+
+  digits = digits.replace(/^0+/, '') || '0';
+  if (digits === '0') return '0'; // avoid returning "-0"
+  return sign + digits;
 }
 
 
@@ -171,7 +198,11 @@ async function evaluate(file) {
     const id = normalize(r[iId]);
     const pred = normalize(r[iPred]);
     if (!KEY.answers.has(id)) { unknown++; continue; }
-    if (seen.has(id)) { duplicates++; continue; }   // first prediction per id counts
+    if (seen.has(id)) {
+      duplicates++;
+      wrong++;
+      continue;
+    }
     seen.add(id);
     if (pred === '') { empty++; wrong++; continue; }
     if (pred === KEY.answers.get(id)) correct++;
@@ -188,7 +219,7 @@ async function evaluate(file) {
 
   const notes = [];
   if (empty)      notes.push(`${empty} prediction(s) were empty and counted as wrong.`);
-  if (duplicates) notes.push(`${duplicates} duplicate MilkingId row(s) ignored (the first one is used).`);
+  if (duplicates) notes.push(`${duplicates} duplicate MilkingId row(s) counted as wrong (the first one is used for comparison).`);
   if (unknown)    notes.push(`${unknown} row(s) had a MilkingId that is not in the test set and were ignored.`);
   if (correct === 0) {
     notes.push(unknown >= seen.size
