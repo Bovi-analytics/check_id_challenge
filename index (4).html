@@ -1,0 +1,183 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Model Evaluation</title>
+<style>
+  :root { --bg:#f7f7f5; --card:#fff; --ink:#1d1d1b; --muted:#6b6b66; --line:#e2e2dc; --accent:#2f6f4f; --bad:#b3402a; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#161614; --card:#1f1f1c; --ink:#ecece6; --muted:#9a9a92; --line:#33332f; --accent:#6fbf94; --bad:#e08a74; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:16px/1.5 system-ui, -apple-system, Segoe UI, sans-serif; }
+  main { max-width:680px; margin:0 auto; padding:32px 16px 64px; }
+  h1 { font-size:1.6rem; margin:0 0 4px; }
+  p.sub { color:var(--muted); margin:0 0 24px; }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:20px; margin-bottom:16px; }
+  #drop { border:2px dashed var(--line); border-radius:12px; padding:32px 16px; text-align:center; cursor:pointer; color:var(--muted); }
+  #drop.over { border-color:var(--accent); color:var(--accent); }
+  #drop strong { color:var(--ink); }
+  code { background:var(--bg); border:1px solid var(--line); border-radius:4px; padding:1px 5px; font-size:.9em; }
+  .big { font-size:3rem; font-weight:700; line-height:1; color:var(--accent); }
+  .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(140px,1fr)); gap:12px; margin-top:16px; }
+  .stat { border:1px solid var(--line); border-radius:8px; padding:10px 12px; }
+  .stat b { display:block; font-size:1.3rem; }
+  .stat span { color:var(--muted); font-size:.85rem; }
+  .warn { color:var(--bad); }
+  ul { padding-left:20px; margin:8px 0 0; }
+  .hidden { display:none; }
+  table { border-collapse:collapse; width:100%; font-size:.9rem; margin-top:8px; }
+  th, td { text-align:left; padding:4px 8px; border-bottom:1px solid var(--line); }
+</style>
+</head>
+<body>
+<main>
+  <h1>Model Evaluation</h1>
+  <p class="sub">Upload your predictions to see how well your AnimalId imputation model performs.</p>
+
+  <div class="card">
+    <strong>Expected format</strong>
+    <p style="margin:6px 0 0">A CSV file with a header row and two columns: <code>MilkingId</code> and <code>AnimalId</code> (your predicted AnimalId). One row per row of the test set.</p>
+  </div>
+
+  <div class="card">
+    <div id="drop" tabindex="0" role="button" aria-label="Upload predictions CSV">
+      <strong>Click to choose a CSV</strong> or drag it here
+      <input id="file" type="file" accept=".csv,text/csv" class="hidden">
+    </div>
+    <p id="status" class="sub" style="margin:12px 0 0"></p>
+  </div>
+
+  <div id="result" class="card hidden">
+    <div class="sub" style="margin:0">Accuracy</div>
+    <div class="big" id="acc">–</div>
+    <div class="grid">
+      <div class="stat"><b id="sCorrect">–</b><span>correct</span></div>
+      <div class="stat"><b id="sWrong">–</b><span>wrong</span></div>
+      <div class="stat"><b id="sMissing">–</b><span>missing (counted wrong)</span></div>
+      <div class="stat"><b id="sTotal">–</b><span>test rows</span></div>
+    </div>
+    <div id="notes"></div>
+  </div>
+</main>
+
+<script>
+// ---------- helpers ----------
+const $ = id => document.getElementById(id);
+
+// Normalise an ID so different spellings of the same number compare equal:
+// "12", "12.0", " 12 " and, for big IDs, "-1452859018307650000",
+// "-1452859018307650000.0" and "-1.45285901830765e+18".
+// IDs that are not plain numbers (e.g. hex strings) are only trimmed.
+// The key is normalised with this same function when the page loads.
+function normalize(v) {
+  v = String(v ?? '').trim();
+  if (/^[-+]?\d+(\.\d+)?([eE][-+]?\d+)?$/.test(v)) return String(Number(v));
+  return v;
+}
+
+
+// Small CSV parser (handles quotes, commas, CRLF)
+function parseCSV(text) {
+  const rows = []; let row = [], cur = '', q = false;
+  text = text.replace(/^\uFEFF/, '');
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (q) {
+      if (c === '"' && text[i+1] === '"') { cur += '"'; i++; }
+      else if (c === '"') q = false;
+      else cur += c;
+    } else if (c === '"') q = true;
+    else if (c === ',') { row.push(cur); cur = ''; }
+    else if (c === '\n' || c === '\r') {
+      if (c === '\r' && text[i+1] === '\n') i++;
+      row.push(cur); cur = '';
+      if (row.some(x => x !== '')) rows.push(row);
+      row = [];
+    } else cur += c;
+  }
+  row.push(cur);
+  if (row.some(x => x !== '')) rows.push(row);
+  return rows;
+}
+
+// ---------- load answer key ----------
+let KEY = null;
+const getOk = r => { if (!r.ok) throw new Error(r.status); return r; };
+Promise.all([
+  fetch('answer_key.json').then(getOk).then(r => r.json()),          // { animals: [distinct AnimalIds] }
+  fetch('answer_key.bin').then(getOk).then(r => r.arrayBuffer())     // pairs of uint32: MilkingId, index into animals
+]).then(([meta, buf]) => {
+  const a = new Uint32Array(buf);
+  const answers = new Map();
+  const animals = meta.animals.map(normalize);
+  for (let i = 0; i + 1 < a.length; i += 2) answers.set(String(a[i]), animals[a[i + 1]]);
+  KEY = { n: answers.size, answers };
+  $('status').textContent = '';
+})
+  .catch(() => {
+    $('status').innerHTML = '<span class="warn">Could not load the answer key files (<code>answer_key.json</code> and <code>answer_key.bin</code>). ' +
+      'If you opened this file directly, serve it over http (e.g. <code>python -m http.server</code>).</span>';
+  });
+
+// ---------- evaluate ----------
+async function evaluate(file) {
+  if (!KEY) { $('status').textContent = 'Answer key not loaded yet, try again in a moment.'; return; }
+  $('status').textContent = 'Evaluating…';
+  $('result').classList.add('hidden');
+
+  const rows = parseCSV(await file.text());
+  if (rows.length < 2) { $('status').innerHTML = '<span class="warn">The file looks empty.</span>'; return; }
+
+  const header = rows[0].map(h => h.trim().toLowerCase());
+  const iId = header.indexOf('milkingid');
+  const iPred = header.indexOf('animalid');
+  if (iId < 0 || iPred < 0) {
+    $('status').innerHTML = '<span class="warn">Header must contain <code>MilkingId</code> and <code>AnimalId</code>.</span>';
+    return;
+  }
+
+  const seen = new Set();
+  let correct = 0, wrong = 0, unknown = 0, duplicates = 0, empty = 0;
+
+  for (const r of rows.slice(1)) {
+    const id = normalize(r[iId]);
+    const pred = normalize(r[iPred]);
+    if (!KEY.answers.has(id)) { unknown++; continue; }
+    if (seen.has(id)) { duplicates++; continue; }   // first prediction per id counts
+    seen.add(id);
+    if (pred === '') { empty++; wrong++; continue; }
+    if (pred === KEY.answers.get(id)) correct++; else wrong++;
+  }
+
+  const total = KEY.n;
+  const missing = total - seen.size;
+  $('acc').textContent = (100 * correct / total).toFixed(1) + '%';
+  $('sCorrect').textContent = correct;
+  $('sWrong').textContent = wrong;
+  $('sMissing').textContent = missing;
+  $('sTotal').textContent = total;
+
+  const notes = [];
+  if (empty)      notes.push(`${empty} prediction(s) were empty and counted as wrong.`);
+  if (duplicates) notes.push(`${duplicates} duplicate MilkingId row(s) ignored (the first one is used).`);
+  if (unknown)    notes.push(`${unknown} row(s) had a MilkingId that is not in the test set and were ignored.`);
+  $('notes').innerHTML = notes.length
+    ? '<ul class="warn">' + notes.map(n => `<li>${n}</li>`).join('') + '</ul>' : '';
+
+  $('status').textContent = `Evaluated ${file.name}`;
+  $('result').classList.remove('hidden');
+}
+
+// ---------- upload UI ----------
+const drop = $('drop'), input = $('file');
+drop.addEventListener('click', () => input.click());
+drop.addEventListener('keydown', e => { if (e.key === 'Enter' || e.key === ' ') input.click(); });
+input.addEventListener('change', () => input.files[0] && evaluate(input.files[0]));
+['dragenter','dragover'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.add('over'); }));
+['dragleave','drop'].forEach(ev => drop.addEventListener(ev, e => { e.preventDefault(); drop.classList.remove('over'); }));
+drop.addEventListener('drop', e => e.dataTransfer.files[0] && evaluate(e.dataTransfer.files[0]));
+</script>
+</body>
+</html>
