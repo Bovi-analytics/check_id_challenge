@@ -38,7 +38,7 @@
 
   <div class="card">
     <strong>Expected format</strong>
-    <p style="margin:6px 0 0">A CSV file with a header row and two columns: <code>MilkingId</code> and <code>predicted_AnimalId</code>. One row per row of the test set.</p>
+    <p style="margin:6px 0 0">A CSV file with a header row and two columns: <code>MilkingId</code> and <code>AnimalId</code>. One row per row of the test set.</p>
   </div>
 
   <div class="card">
@@ -128,9 +128,9 @@ async function evaluate(file) {
 
   const header = rows[0].map(h => h.trim().toLowerCase());
   const iId = header.indexOf('milkingid');
-  const iPred = header.indexOf('predicted_animalid');
+  const iPred = header.indexOf('animalid');
   if (iId < 0 || iPred < 0) {
-    $('status').innerHTML = '<span class="warn">Header must contain <code>MilkingId</code> and <code>predicted_AnimalId</code>.</span>';
+    $('status').innerHTML = '<span class="warn">Header must contain <code>MilkingId</code> and <code>AnimalId</code>.</span>';
     return;
   }
 
